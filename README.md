@@ -71,6 +71,15 @@ descriptions.  The most important ones:
 | `TARGET_PROVINCE` | Province to monitor (default: `Barcelona`) |
 | `TARGET_PROCEDURE_TEXT` | Partial procedure name (default: `TOMA DE HUELLAS`) |
 | `HEADLESS` | `false` to watch the browser (debug), `true` for server use |
+| `NAVIGATION_TIMEOUT_MS` | Timeout for navigation waits (default reliability-first: `65000`) |
+| `ACTION_TIMEOUT_MS` | Timeout for click actions (default: `15000`) |
+| `STAGE_READY_TIMEOUT_MS` | Max wait for a detectable stage after transitions |
+| `UNKNOWN_STAGE_EXP_BACKOFF` | `true` enables exponential backoff for unknown-stage retries |
+| `UNKNOWN_STAGE_MAX_TOTAL_MS` | Cumulative unknown-stage retry budget in ms |
+| `PROXY_PREFLIGHT_ENABLED` | `true` validates proxy connectivity before ICP flow starts |
+| `PROXY_PREFLIGHT_URLS` | Comma-separated preflight endpoints (default includes `httpbin` and `ipify`) |
+| `BLOCK_STREAK_BASE_SECONDS` | Base backoff used for consecutive block escalation |
+| `BLOCK_STREAK_MAX_SECONDS` | Cap for escalated consecutive block backoff |
 | `RUN_ONCE` | `true` = single run then exit (testing) |
 | `DRY_RUN` | `true` = no Telegram alerts sent |
 
