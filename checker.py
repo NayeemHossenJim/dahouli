@@ -1,5 +1,6 @@
 import random
 import re
+import time
 import unicodedata
 import html as html_lib
 from datetime import datetime
@@ -10,19 +11,28 @@ from playwright.sync_api import sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from config import (
+    ACTION_TIMEOUT_MS,
     ACTION_DELAY_MAX_MS,
     ACTION_DELAY_MIN_MS,
     DEBUG_ARTIFACTS_DIR,
     HEADLESS,
     MANUAL_ALLOW_WAIT_SECONDS,
+    NAVIGATION_TIMEOUT_MS,
     NATIONALITY,
     NIE,
     NAME,
     PAGE_TIMEOUT_MS,
+    PROXY_PREFLIGHT_ENABLED,
+    PROXY_PREFLIGHT_TIMEOUT_MS,
+    PROXY_PREFLIGHT_URLS,
     SAVE_DEBUG_ARTIFACTS,
+    STAGE_READY_POLL_MS,
+    STAGE_READY_TIMEOUT_MS,
     TARGET_PROCEDURE_TEXT,
     TARGET_PROVINCE,
+    UNKNOWN_STAGE_EXP_BACKOFF,
     UNKNOWN_STAGE_MAX_RETRIES,
+    UNKNOWN_STAGE_MAX_TOTAL_MS,
     UNKNOWN_STAGE_RETRY_BASE_MS,
     UNKNOWN_STAGE_RETRY_MAX_MS,
     UNKNOWN_STAGE_RETRY_STEP_MS,
@@ -254,13 +264,135 @@ def _wait_for_manual_allow(page):
     page.wait_for_timeout(MANUAL_ALLOW_WAIT_SECONDS * 1000)
 
 
-def _wait_for_navigation(page, reason=""):
+def _log(run_tag, message):
+    if run_tag:
+        print(f"Checker[{run_tag}]: {message}")
+        return
+    print(f"Checker: {message}")
+
+
+def _wait_for_navigation(page, reason="", run_tag=None):
+    nav_ready = True
+
     try:
-        page.wait_for_load_state("domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+        page.wait_for_load_state("domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
     except PlaywrightTimeoutError:
-        print(f"Checker: navigation wait timed out{' (' + reason + ')' if reason else ''}, continuing anyway")
+        nav_ready = False
+        _log(
+            run_tag,
+            f"navigation wait timed out{' (' + reason + ')' if reason else ''}",
+        )
     except Exception as exc:
-        print(f"Checker: navigation wait error{' (' + reason + ')' if reason else ''}: {exc}")
+        nav_ready = False
+        _log(
+            run_tag,
+            f"navigation wait error{' (' + reason + ')' if reason else ''}: {exc}",
+        )
+
+    # networkidle can be noisy on dynamic pages, so treat timeout as informational only.
+    try:
+        page.wait_for_load_state("networkidle", timeout=min(15000, NAVIGATION_TIMEOUT_MS))
+    except PlaywrightTimeoutError:
+        pass
+    except Exception:
+        pass
+
+    return nav_ready
+
+
+def _wait_for_stage_ready(page, reason="", run_tag=None):
+    deadline = time.time() + (STAGE_READY_TIMEOUT_MS / 1000)
+    last_stage = "unknown"
+
+    while time.time() < deadline:
+        stage, _ = _detect_page_stage(page)
+        last_stage = stage
+        if stage != "unknown":
+            return stage
+        page.wait_for_timeout(STAGE_READY_POLL_MS)
+
+    _log(run_tag, f"stage readiness timed out{' (' + reason + ')' if reason else ''}")
+    return last_stage
+
+
+def _detect_block_from_response(page, response):
+    try:
+        if response and response.status >= 400:
+            return f"http {response.status}"
+    except Exception:
+        pass
+
+    try:
+        title_marker = _detect_block_marker(_normalize_text(page.title() or ""))
+        if title_marker:
+            return title_marker
+    except Exception:
+        pass
+
+    try:
+        return _detect_block_marker(_get_page_text(page))
+    except Exception:
+        return None
+
+
+def _run_proxy_preflight(context, run_tag=None):
+    if not PROXY_PREFLIGHT_ENABLED or not PROXY_PREFLIGHT_URLS:
+        return True, "Proxy preflight disabled"
+
+    failures = []
+    preflight_page = None
+
+    try:
+        # Use real page navigation so proxy auth is exercised exactly like the
+        # main ICP flow. context.request may produce false 407s with some proxies.
+        preflight_page = context.new_page()
+        preflight_page.set_default_timeout(PROXY_PREFLIGHT_TIMEOUT_MS)
+
+        for url in PROXY_PREFLIGHT_URLS:
+            try:
+                response = preflight_page.goto(
+                    url,
+                    wait_until="domcontentloaded",
+                    timeout=PROXY_PREFLIGHT_TIMEOUT_MS,
+                )
+            except PlaywrightTimeoutError:
+                failures.append(f"{url}: timeout")
+                continue
+            except Exception as exc:
+                if _looks_like_proxy_auth_failure(str(exc)):
+                    failures.append(f"{url}: HTTP 407")
+                else:
+                    failures.append(f"{url}: {exc}")
+                continue
+
+            if response and response.ok:
+                _log(run_tag, f"proxy preflight passed via {url} (status={response.status})")
+                return True, f"Proxy preflight passed via {url}"
+
+            if response is None:
+                failures.append(f"{url}: no response")
+                continue
+
+            failures.append(f"{url}: HTTP {response.status}")
+    finally:
+        if preflight_page:
+            try:
+                preflight_page.close()
+            except Exception:
+                pass
+
+    if any("HTTP 407" in failure for failure in failures):
+        details = "; ".join(failures[:3]) if failures else "no endpoint reachable"
+        return (
+            False,
+            (
+                "Proxy authentication failed (HTTP 407) during preflight "
+                f"({details}). Check Oxylabs username/password and account access"
+            ),
+        )
+
+    details = "; ".join(failures[:3]) if failures else "no endpoint reachable"
+    return False, f"Proxy preflight failed ({details})"
 
 
 def _detect_final_menu_actions(page_text):
@@ -346,6 +478,19 @@ def _detect_block_marker(page_text):
     return None
 
 
+def _looks_like_proxy_auth_failure(error_text):
+    text = _normalize_text(error_text or "")
+    markers = [
+        "proxy authentication failed",
+        "proxy authentication required",
+        "http 407",
+        "407 proxy authentication required",
+        "tunnel connection failed",
+        "err_http_response_code_failure",
+    ]
+    return any(marker in text for marker in markers)
+
+
 # ---------------------------------------------------------------------------
 # Stage detection
 # NOTE: Order matters  -  more specific checks come first.
@@ -379,7 +524,14 @@ def _detect_page_stage(page):
         return "final_menu", page_text
 
     # 4. Office + procedure selector  -  try element first
-    if _has_any_selector(page, ["select[name='tramiteGrupo[0]']", "select#tramiteGrupo\\[0\\]"]):
+    if _has_any_selector(
+        page,
+        [
+            "select[name='tramiteGrupo[0]']",
+            "select[id='tramiteGrupo[0]']",
+            "select#tramiteGrupo\\[0\\]",
+        ],
+    ):
         return "office_and_procedure", page_text
 
     # 5. Presentación sin Cl@ve choice page  -  check BEFORE identity_form
@@ -615,6 +767,7 @@ def _select_option_contains(page, keyword, preferred_hints=None, include_hints=N
 def _select_police_procedure(page):
     selectors = [
         "select[name='tramiteGrupo[0]']",
+        "select[id='tramiteGrupo[0]']",
         "select#tramiteGrupo\\[0\\]",
         "select[name^='tramiteGrupo']",
     ]
@@ -681,14 +834,14 @@ def _click_accept(page):
     for selector in accept_locators:
         locator = page.locator(selector)
         if locator.count() > 0:
-            locator.first.click(timeout=PAGE_TIMEOUT_MS)
+            locator.first.click(timeout=ACTION_TIMEOUT_MS)
             return True
 
     text_candidates = ["Aceptar", "ACEPTAR", "Accept", "ACCEPT"]
     for text in text_candidates:
         locator = page.get_by_text(text, exact=True)
         if locator.count() > 0:
-            locator.first.click(timeout=PAGE_TIMEOUT_MS)
+            locator.first.click(timeout=ACTION_TIMEOUT_MS)
             return True
 
     return False
@@ -707,13 +860,13 @@ def _click_sin_clave(page):
         for role in ("button", "link"):
             locator = page.get_by_role(role, name=re.compile(re.escape(text), re.IGNORECASE))
             if locator.count() > 0:
-                locator.first.click(timeout=PAGE_TIMEOUT_MS)
+                locator.first.click(timeout=ACTION_TIMEOUT_MS)
                 return True
 
     for text in candidates:
         locator = page.get_by_text(text, exact=False)
         if locator.count() > 0:
-            locator.first.click(timeout=PAGE_TIMEOUT_MS)
+            locator.first.click(timeout=ACTION_TIMEOUT_MS)
             return True
 
     clicked = page.evaluate(
@@ -764,7 +917,7 @@ def _click_request_appointment(page):
         for role in ("button", "link"):
             locator = page.get_by_role(role, name=pattern)
             if locator.count() > 0:
-                locator.first.click(timeout=PAGE_TIMEOUT_MS)
+                locator.first.click(timeout=ACTION_TIMEOUT_MS)
                 return True
 
     selector_candidates = [
@@ -778,7 +931,7 @@ def _click_request_appointment(page):
     for selector in selector_candidates:
         locator = page.locator(selector)
         if locator.count() > 0:
-            locator.first.click(timeout=PAGE_TIMEOUT_MS)
+            locator.first.click(timeout=ACTION_TIMEOUT_MS)
             return True
 
     return False
@@ -796,7 +949,7 @@ def _click_access_procedure(page):
             locator = page.get_by_role(role, name=pattern)
             if locator.count() > 0:
                 try:
-                    locator.first.click(timeout=PAGE_TIMEOUT_MS)
+                    locator.first.click(timeout=ACTION_TIMEOUT_MS)
                     return True
                 except PlaywrightTimeoutError:
                     continue
@@ -811,7 +964,7 @@ def _click_access_procedure(page):
         locator = page.locator(selector)
         if locator.count() > 0:
             try:
-                locator.first.click(timeout=PAGE_TIMEOUT_MS)
+                locator.first.click(timeout=ACTION_TIMEOUT_MS)
                 return True
             except PlaywrightTimeoutError:
                 continue
@@ -881,7 +1034,7 @@ def _save_debug_artifacts(page, reason):
         html_path = artifacts_dir / f"{timestamp}_{safe_reason}.html"
         page.screenshot(path=str(screenshot_path), full_page=True)
         html_path.write_text(page.content(), encoding="utf-8")
-        print(f"Checker: debug artifacts saved -> {screenshot_path}")
+        print(f"Checker: debug artifacts saved -> {screenshot_path} | {html_path}")
     except Exception:
         pass
 
@@ -897,9 +1050,12 @@ def check_appointments(proxy_value=None):
         (True,  reason_str)   -  appointment slots detected
         (False, reason_str)   -  no slots, or an error occurred
     """
+    run_tag = datetime.now().strftime("%H%M%S%f")[-10:]
+
     with sync_playwright() as p:
         browser = None
         context = None
+        proxy = None
 
         try:
             proxy = _parse_proxy(proxy_value) if proxy_value else None
@@ -944,25 +1100,53 @@ def check_appointments(proxy_value=None):
             # ── Inject stealth JS into every new page before any scripts run ──
             context.add_init_script(_STEALTH_INIT_SCRIPT)
 
+            if proxy:
+                preflight_ok, preflight_reason = _run_proxy_preflight(context, run_tag=run_tag)
+                if not preflight_ok:
+                    return False, preflight_reason
+
             page = context.new_page()
             page.set_default_timeout(PAGE_TIMEOUT_MS)
 
-            print(f"Checker: launching with UA={user_agent[:60]}...")
+            _log(run_tag, f"launching with UA={user_agent[:60]}... proxy={'yes' if proxy else 'no'}")
 
-            page.goto(URL, wait_until="domcontentloaded")
+            initial_response = page.goto(
+                URL,
+                wait_until="domcontentloaded",
+                timeout=NAVIGATION_TIMEOUT_MS,
+            )
+            _wait_for_navigation(page, "initial landing", run_tag=run_tag)
             _human_pause(page)
             _wait_for_manual_allow(page)
+
+            initial_marker = _detect_block_from_response(page, initial_response)
+            if initial_marker:
+                _save_debug_artifacts(page, "initial_block_or_challenge")
+                return False, f"Blocked or challenged on initial landing ({initial_marker})"
+
+            _wait_for_stage_ready(page, "initial stage readiness", run_tag=run_tag)
             _human_pause(page)
 
             max_stage_transitions = 12
             max_unknown_stage_retries = UNKNOWN_STAGE_MAX_RETRIES
             unknown_stage_retries = 0
+            unknown_stage_total_wait_ms = 0
+            unknown_stage_soft_reload_done = False
+
             for transition in range(max_stage_transitions):
                 stage, page_text = _detect_page_stage(page)
-                print(f"Checker: stage={stage} | url={page.url}")
+                _log(
+                    run_tag,
+                    (
+                        f"transition={transition + 1}/{max_stage_transitions} "
+                        f"stage={stage} | url={page.url}"
+                    ),
+                )
 
                 if stage != "unknown":
                     unknown_stage_retries = 0
+                    unknown_stage_total_wait_ms = 0
+                    unknown_stage_soft_reload_done = False
 
                 # ── Blocked ────────────────────────────────────────────────
                 if stage == "blocked":
@@ -994,10 +1178,18 @@ def check_appointments(proxy_value=None):
 
                 # ── Final action menu ──────────────────────────────────────
                 if stage == "final_menu":
+                    # Extended pause before final request to avoid WAF detection
+                    extended_pause_ms = random.randint(3000, 6000)
+                    page.wait_for_timeout(extended_pause_ms)
+
                     if not _click_request_appointment(page):
                         _save_debug_artifacts(page, "request_appointment_button_missing")
                         return False, "Could not click 'Solicitar Cita' on final menu"
-                    _wait_for_navigation(page, "after solicitar cita")
+
+                    # Wait longer for response after submission to avoid timeouts
+                    _wait_for_navigation(page, "after solicitar cita", run_tag=run_tag)
+                    page.wait_for_timeout(2000)  # Extra buffer after navigation
+                    _wait_for_stage_ready(page, "after solicitar cita", run_tag=run_tag)
                     _human_pause(page)
                     continue
 
@@ -1006,7 +1198,8 @@ def check_appointments(proxy_value=None):
                     if not _click_access_procedure(page):
                         _save_debug_artifacts(page, "entry_not_found")
                         return False, "Could not find landing entry button ('Acceder al Procedimiento')"
-                    _wait_for_navigation(page, "after entry click")
+                    _wait_for_navigation(page, "after entry click", run_tag=run_tag)
+                    _wait_for_stage_ready(page, "after entry click", run_tag=run_tag)
                     _human_pause(page)
                     continue
 
@@ -1021,7 +1214,8 @@ def check_appointments(proxy_value=None):
                         _save_debug_artifacts(page, "province_accept_missing")
                         return False, "Accept button not found on province page"
 
-                    _wait_for_navigation(page, "after province accept")
+                    _wait_for_navigation(page, "after province accept", run_tag=run_tag)
+                    _wait_for_stage_ready(page, "after province accept", run_tag=run_tag)
                     _human_pause(page)
                     continue
 
@@ -1030,14 +1224,15 @@ def check_appointments(proxy_value=None):
                     if not _select_police_procedure(page):
                         _save_debug_artifacts(page, "procedure_not_found")
                         return False, f"Procedure containing '{TARGET_PROCEDURE_TEXT}' not found"
-                    print("Checker: procedure selected on TRAMITES POLICIA NACIONAL")
+                    _log(run_tag, "procedure selected on TRAMITES POLICIA NACIONAL")
                     _human_pause(page)
 
                     if not _click_accept(page):
                         _save_debug_artifacts(page, "procedure_accept_missing")
                         return False, "Accept button not found on office/procedure page"
 
-                    _wait_for_navigation(page, "after office/procedure accept")
+                    _wait_for_navigation(page, "after office/procedure accept", run_tag=run_tag)
+                    _wait_for_stage_ready(page, "after office/procedure accept", run_tag=run_tag)
                     _human_pause(page)
                     continue
 
@@ -1047,7 +1242,8 @@ def check_appointments(proxy_value=None):
                         _save_debug_artifacts(page, "sin_clave_not_found")
                         return False, "'Presentación sin Cl@ve' option not found"
 
-                    _wait_for_navigation(page, "after sin_clave click")
+                    _wait_for_navigation(page, "after sin_clave click", run_tag=run_tag)
+                    _wait_for_stage_ready(page, "after sin_clave click", run_tag=run_tag)
                     _human_pause(page)
                     continue
 
@@ -1062,8 +1258,8 @@ def check_appointments(proxy_value=None):
                         _save_debug_artifacts(page, "identity_accept_missing")
                         return False, "Accept button not found on identity form"
 
-                    _wait_for_navigation(page, "after identity form accept")
-                    page.wait_for_timeout(2000)
+                    _wait_for_navigation(page, "after identity form accept", run_tag=run_tag)
+                    _wait_for_stage_ready(page, "after identity form accept", run_tag=run_tag)
                     _human_pause(page)
                     continue
 
@@ -1078,24 +1274,76 @@ def check_appointments(proxy_value=None):
                 if _contains_any(page_text, AVAILABILITY_HINTS):
                     return True, "Appointment slots detected"
 
-                if stage == "unknown" and unknown_stage_retries < max_unknown_stage_retries:
+                if (
+                    stage == "unknown"
+                    and unknown_stage_retries < max_unknown_stage_retries
+                    and unknown_stage_total_wait_ms < UNKNOWN_STAGE_MAX_TOTAL_MS
+                ):
                     unknown_stage_retries += 1
-                    retry_wait_ms = min(
-                        UNKNOWN_STAGE_RETRY_BASE_MS
-                        + (unknown_stage_retries - 1) * UNKNOWN_STAGE_RETRY_STEP_MS,
-                        UNKNOWN_STAGE_RETRY_MAX_MS,
+
+                    if UNKNOWN_STAGE_EXP_BACKOFF:
+                        retry_wait_ms = min(
+                            UNKNOWN_STAGE_RETRY_BASE_MS * (2 ** (unknown_stage_retries - 1)),
+                            UNKNOWN_STAGE_RETRY_MAX_MS,
+                        )
+                    else:
+                        retry_wait_ms = min(
+                            UNKNOWN_STAGE_RETRY_BASE_MS
+                            + (unknown_stage_retries - 1) * UNKNOWN_STAGE_RETRY_STEP_MS,
+                            UNKNOWN_STAGE_RETRY_MAX_MS,
+                        )
+
+                    remaining_budget_ms = max(0, UNKNOWN_STAGE_MAX_TOTAL_MS - unknown_stage_total_wait_ms)
+                    if remaining_budget_ms <= 0:
+                        break
+
+                    retry_wait_ms = min(retry_wait_ms, remaining_budget_ms)
+
+                    _log(
+                        run_tag,
+                        (
+                            f"stage unknown retry {unknown_stage_retries}/{max_unknown_stage_retries} "
+                            f"after {retry_wait_ms}ms "
+                            f"(budget left {remaining_budget_ms}ms)"
+                        ),
                     )
-                    print(
-                        "Checker: stage unknown  -  "
-                        f"retry {unknown_stage_retries}/{max_unknown_stage_retries} "
-                        f"after {retry_wait_ms}ms"
+                    _wait_for_navigation(
+                        page,
+                        f"unknown-stage retry {unknown_stage_retries}",
+                        run_tag=run_tag,
                     )
-                    _wait_for_navigation(page, f"unknown-stage retry {unknown_stage_retries}")
                     page.wait_for_timeout(retry_wait_ms)
+                    unknown_stage_total_wait_ms += retry_wait_ms
+                    continue
+
+                if stage == "unknown" and not unknown_stage_soft_reload_done:
+                    unknown_stage_soft_reload_done = True
+                    _log(run_tag, "stage remained unknown  -  performing one soft reload")
+                    try:
+                        reload_response = page.reload(
+                            wait_until="domcontentloaded",
+                            timeout=NAVIGATION_TIMEOUT_MS,
+                        )
+                    except PlaywrightTimeoutError:
+                        reload_response = None
+
+                    _wait_for_navigation(page, "after unknown-stage soft reload", run_tag=run_tag)
+                    reload_marker = _detect_block_from_response(page, reload_response)
+                    if reload_marker:
+                        _save_debug_artifacts(page, "unknown_stage_soft_reload_blocked")
+                        return False, f"Blocked or challenged after soft reload ({reload_marker})"
+
+                    _wait_for_stage_ready(page, "after unknown-stage soft reload", run_tag=run_tag)
                     continue
 
                 _save_debug_artifacts(page, "stage_detection_failed")
-                return False, f"Unknown page stage reached ({page.url})"
+                return (
+                    False,
+                    (
+                        f"Unknown page stage reached ({page.url}) after {unknown_stage_retries} retries "
+                        f"and {unknown_stage_total_wait_ms}ms unknown-stage wait"
+                    ),
+                )
 
             # Loop exhausted without reaching a terminal state
             page_text = _get_page_text(page)
@@ -1119,7 +1367,7 @@ def check_appointments(proxy_value=None):
             return False, "Flow did not reach a terminal state within the allowed transitions"
 
         except PlaywrightTimeoutError as exc:
-            if context:
+            if context and context.pages:
                 try:
                     page = context.pages[-1]
                     page_text = _get_page_text(page)
@@ -1132,7 +1380,13 @@ def check_appointments(proxy_value=None):
             return False, f"Timeout: {exc}"
 
         except Exception as exc:
-            if context:
+            if proxy and _looks_like_proxy_auth_failure(str(exc)):
+                return (
+                    False,
+                    "Proxy authentication failed (HTTP 407) while opening target site. "
+                    "Check Oxylabs username/password and account access",
+                )
+            if context and context.pages:
                 try:
                     _save_debug_artifacts(context.pages[-1], "exception")
                 except Exception:
