@@ -9,6 +9,8 @@ from checker import check_appointments
 from config import (
     BLOCK_BACKOFF_MAX_SECONDS,
     BLOCK_BACKOFF_MIN_SECONDS,
+    BLOCK_STREAK_BASE_SECONDS,
+    BLOCK_STREAK_MAX_SECONDS,
     CHECK_INTERVAL_MAX_SECONDS,
     CHECK_INTERVAL_MIN_SECONDS,
     DRY_RUN,
@@ -29,12 +31,14 @@ from config import (
     TARGET_PROCEDURE_TEXT,
     TARGET_PROVINCE,
     UNAVAILABLE_NOTIFY_COOLDOWN_SECONDS,
+    SUPPORT_ID_EXTRA_BACKOFF_SECONDS,
     validate_required_config,
 )
 
 BLOCK_REASON_MARKERS = [
     "blocked or challenged",
     "timeout under challenge/block",
+    "proxy preflight failed",
     "err_tunnel_connection_failed",
     "tunnel_connection_failed",
     "tunnel connection failed",
@@ -52,6 +56,16 @@ BLOCK_REASON_MARKERS = [
     "are you a robot",
     "target page, context or browser has been closed",
     "page.wait_for_timeout: target page, context or browser has been closed",
+]
+
+PROXY_AUTH_REASON_MARKERS = [
+    "proxy authentication failed",
+    "proxy authentication required",
+    "http 407",
+    "407 proxy authentication required",
+    "tunnel connection failed",
+    "proxy preflight failed",
+    "err_http_response_code_failure",
 ]
 
 SUPPORT_ID_REASON_MARKERS = [
@@ -85,6 +99,11 @@ def _is_blocked_reason(reason):
 def _is_support_id_reason(reason):
     lowered = (reason or "").strip().lower()
     return any(marker in lowered for marker in SUPPORT_ID_REASON_MARKERS)
+
+
+def _is_proxy_auth_reason(reason):
+    lowered = (reason or "").strip().lower()
+    return any(marker in lowered for marker in PROXY_AUTH_REASON_MARKERS)
 
 
 def _mask_proxy(proxy_value):
@@ -159,7 +178,11 @@ def _refresh_oxylabs_session_in_proxy_url(proxy_value):
 
 
 def _build_oxylabs_proxy(session_id=None):
-    username_parts = [f"customer-{OXYLABS_USERNAME}"]
+    base_username = OXYLABS_USERNAME
+    if not base_username.lower().startswith("customer-"):
+        base_username = f"customer-{base_username}"
+
+    username_parts = [base_username]
 
     if OXYLABS_COUNTRY:
         username_parts.append(f"cc-{OXYLABS_COUNTRY.upper()}")
@@ -216,41 +239,44 @@ def _build_alert_message(reason):
 
 
 def _build_unavailable_message(reason):
-    """Build a Telegram status message for unavailable/error outcomes."""
+    """Build a Telegram status message for unavailable/error outcomes.
+
+    Treats WAF blocks, network errors, and other access issues as "no appointments"
+    for user-facing messages, while internal logs capture the actual technical reason.
+    """
     reason_text = (reason or "Unknown reason").strip()
     reason_lower = reason_text.lower()
 
-    if _is_support_id_reason(reason_text):
+    if _is_proxy_auth_reason(reason_text):
         return (
             f"[WARNING] CITA PREVIA STATUS  -  {TARGET_PROVINCE}\n"
             f"Procedure: {TARGET_PROCEDURE_TEXT}\n\n"
-            f"WAF support-id rejection while checking appointments.\n"
+            f"Proxy authentication failed (HTTP 407).\n"
             f"Reason: {reason_text}\n\n"
-            f"The monitor will force proxy/session refresh and apply extra backoff."
+            f"Check OXYLABS_USERNAME / OXYLABS_PASSWORD and account access."
         )
 
-    if _is_blocked_reason(reason_text):
+    # Treat all other access issues (WAF blocks, rate limiting, network errors) as no appointments
+    # This provides a cleaner user experience: just say appointments aren't available
+    if _is_support_id_reason(reason_text) or _is_blocked_reason(reason_text):
         return (
-            f"[WARNING] CITA PREVIA STATUS  -  {TARGET_PROVINCE}\n"
+            f"[INFO] CITA PREVIA STATUS  -  {TARGET_PROVINCE}\n"
             f"Procedure: {TARGET_PROCEDURE_TEXT}\n\n"
-            f"Blocked/challenged while checking appointments.\n"
-            f"Reason: {reason_text}\n\n"
-            f"The monitor will rotate proxy/session and retry."
+            f"No appointments available right now.\n"
+            f"Monitor will continue checking..."
         )
 
     if "no appointment" in reason_lower or "no appointments" in reason_lower:
         return (
             f"[INFO] CITA PREVIA STATUS  -  {TARGET_PROVINCE}\n"
             f"Procedure: {TARGET_PROCEDURE_TEXT}\n\n"
-            f"No appointments available right now.\n"
-            f"Reason: {reason_text}"
+            f"No appointments available right now."
         )
 
     return (
         f"[INFO] CITA PREVIA STATUS  -  {TARGET_PROVINCE}\n"
         f"Procedure: {TARGET_PROCEDURE_TEXT}\n\n"
-        f"No bookable appointment detected in this check.\n"
-        f"Reason: {reason_text}"
+        f"No appointments available right now."
     )
 
 
@@ -266,6 +292,8 @@ def run_monitor():
     current_proxy_runtime = None
     current_proxy_runtime_session_id = None
     oxylabs_session_id = None
+    consecutive_block_streak = 0
+    consecutive_proxy_auth_failures = 0
     last_notification_at = 0.0
     last_unavailable_notification_at = 0.0
     last_unavailable_reason = ""
@@ -333,10 +361,50 @@ def run_monitor():
             print(f"Run {run_number}: available={available} | reason={reason}")
 
             # ── Block / challenge handling ─────────────────────────────────────
-            blocked_or_challenged = _is_blocked_reason(reason)
+            proxy_auth_failed = _is_proxy_auth_reason(reason)
+            blocked_or_challenged = _is_blocked_reason(reason) and not proxy_auth_failed
             support_id_blocked = _is_support_id_reason(reason)
-            if blocked_or_challenged:
+
+            if proxy_auth_failed:
+                consecutive_proxy_auth_failures += 1
                 runs_on_current_proxy = PROXY_ROTATE_EVERY  # force rotation on next run
+                print(
+                    f"Run {run_number}: proxy-auth failure streak="
+                    f"{consecutive_proxy_auth_failures}"
+                )
+
+                if OXYLABS_ENABLED and OXYLABS_STICKY_SESSION:
+                    previous_session = oxylabs_session_id or "none"
+                    oxylabs_session_id = None
+                    print(
+                        f"Run {run_number}: proxy auth failed  -  forcing Oxylabs session rotation "
+                        f"(previous session={previous_session})"
+                    )
+                elif PROXIES:
+                    current_proxy_runtime = None
+                    current_proxy_runtime_session_id = None
+                    print(
+                        f"Run {run_number}: proxy auth failed  -  force proxy rotation "
+                        f"and list-proxy session refresh"
+                    )
+
+                if consecutive_proxy_auth_failures >= 3:
+                    print(
+                        f"Run {run_number}: stopping monitor after 3 consecutive proxy auth failures. "
+                        "Verify Oxylabs credentials/account status and restart."
+                    )
+                    break
+            elif consecutive_proxy_auth_failures:
+                print(
+                    f"Run {run_number}: proxy-auth streak reset "
+                    f"(was {consecutive_proxy_auth_failures})"
+                )
+                consecutive_proxy_auth_failures = 0
+
+            if blocked_or_challenged:
+                consecutive_block_streak += 1
+                runs_on_current_proxy = PROXY_ROTATE_EVERY  # force rotation on next run
+                print(f"Run {run_number}: block streak={consecutive_block_streak}")
                 if support_id_blocked:
                     print(f"Run {run_number}: support-id rejection detected  -  escalating recovery")
 
@@ -359,6 +427,12 @@ def run_monitor():
                         print(f"Run {run_number}: block/challenge  -  proxy will rotate on next run")
                 else:
                     print(f"Run {run_number}: block/challenge  -  no proxy configured")
+            elif consecutive_block_streak:
+                print(
+                    f"Run {run_number}: block streak reset "
+                    f"(was {consecutive_block_streak})"
+                )
+                consecutive_block_streak = 0
 
             # ── Notification ───────────────────────────────────────────────────
             now = time.time()
@@ -414,13 +488,29 @@ def run_monitor():
 
             # ── Sleep ──────────────────────────────────────────────────────────
             wait_time = _safe_interval_seconds()
-            if blocked_or_challenged:
-                extra_backoff = _block_backoff_seconds()
+            if proxy_auth_failed:
+                wait_time = min(wait_time, 90)
+                print(
+                    f"Run {run_number}: proxy-auth retry delay set to {wait_time}s"
+                )
+            elif blocked_or_challenged:
+                jitter_backoff = _block_backoff_seconds()
+                escalated_backoff = min(
+                    BLOCK_STREAK_BASE_SECONDS * (2 ** max(0, consecutive_block_streak - 1)),
+                    BLOCK_STREAK_MAX_SECONDS,
+                )
+                extra_backoff = max(jitter_backoff, escalated_backoff)
                 wait_time += extra_backoff
-                print(f"Run {run_number}: block backoff applied (+{extra_backoff}s)")
+                print(
+                    f"Run {run_number}: block backoff applied (+{extra_backoff}s) "
+                    f"[jitter={jitter_backoff}s escalated={escalated_backoff}s]"
+                )
 
                 if support_id_blocked:
-                    support_id_extra_backoff = max(60, _block_backoff_seconds())
+                    support_id_extra_backoff = max(
+                        SUPPORT_ID_EXTRA_BACKOFF_SECONDS,
+                        extra_backoff // 2,
+                    )
                     wait_time += support_id_extra_backoff
                     print(
                         f"Run {run_number}: support-id extra backoff applied "
